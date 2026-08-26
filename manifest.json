@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.sahzudin.hotcorners",
+  "name": "Hot Corners",
+  "version": "1.0.0",
+  "author": "Sahzudin Mahmic",
+  "license": "MIT",
+  "description": "Configure macOS-style hot corners: pick an action for each screen corner.",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  }
+}
