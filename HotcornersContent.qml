@@ -24,6 +24,10 @@ FocusScope {
   property var options: ({ "dwell": 250, "corner": 10, "edge": 4 })
   property var actions: []
   property bool installed: true
+
+  // Set when the last `sync` failed, so the status line can say why the
+  // corners are inactive instead of just that they are.
+  property string syncError: ""
   property bool busy: false
   property string statusText: "Loading hot corners…"
   property bool statusIsError: false
@@ -110,9 +114,21 @@ FocusScope {
     catch (error) { return { ok: false, error: "The backend returned invalid data." } }
   }
 
+  // No `omarchy plugin` command runs plugin code, so opening the panel is
+  // what installs the Hyprland driver after a fresh add, and what refreshes it
+  // after an update. `sync` is a no-op once the runtime matches the checkout.
   function refresh() {
-    if (listProcess.running) return
+    if (syncProcess.running || listProcess.running) return
     root.loading = true
+    root.statusIsError = false
+    root.statusText = "Loading hot corners…"
+    syncProcess.command = ["python3", root.backendPath, "sync"]
+    syncProcess.running = true
+  }
+
+  function onSyncResult(raw) {
+    var result = root.parseOutput(raw)
+    root.syncError = result.ok ? "" : (result.error || "Could not set up hot corners.")
     listProcess.command = ["python3", root.backendPath, "list"]
     listProcess.running = true
   }
@@ -145,7 +161,9 @@ FocusScope {
     root.statusIsError = !root.installed
     root.statusText = root.installed
       ? "No unsaved changes"
-      : "Hot corners are not installed. Run the plugin install script first."
+      : (root.syncError !== ""
+        ? root.syncError
+        : "Hot corners are not installed. Run the plugin's install.sh.")
 
     // Let the control writes above settle before edits count as user intent.
     Qt.callLater(function() { root.loading = false })
@@ -205,6 +223,15 @@ FocusScope {
   Component.onCompleted: root.refresh()
 
   Keys.onEscapePressed: root.closeRequested()
+
+  Process {
+    id: syncProcess
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onSyncResult(text)
+    }
+  }
 
   Process {
     id: listProcess

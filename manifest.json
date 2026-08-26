@@ -4,7 +4,7 @@
   "name": "Hot Corners",
   "version": "1.0.0",
   "author": "Sahzudin Mahmic",
-  "license": "MIT",
+  "license": "MIT AND GPL-3.0-only",
   "description": "Configure macOS-style hot corners: pick an action for each screen corner.",
   "kinds": [
     "panel"
