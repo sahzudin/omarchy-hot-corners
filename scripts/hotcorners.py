@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,13 @@ HOOK_BODY = f'require("{REQUIRE_PATH}")'
 ANY_REQUIRE_RE = re.compile(r'^[ \t]*require\("hypr\.hotcorners(?:\.init)?"\).*\n?', re.M)
 
 STAMP_NAME = ".install.json"
+
+# Panel startup invokes `sync` automatically, so none of its reads may trust a
+# predictable user-writable pathname.  Configuration and shipped source files
+# are deliberately small; this ceiling prevents a replaced or growing file
+# from consuming unbounded memory before it is parsed, fingerprinted, or
+# rewritten.
+MAX_READ_BYTES = 1024 * 1024
 
 CORNER_ORDER = ("top-left", "top-right", "bottom-left", "bottom-right")
 
@@ -146,19 +154,78 @@ def emit(payload: dict[str, Any]) -> int:
 def locked():
     lock_path = paths()["lock"]
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(f"Could not open lock {lock_path} safely: {error}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError(f"Refusing non-regular lock file {lock_path}")
+        handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def read_bytes(path: Path, *, max_bytes: int = MAX_READ_BYTES) -> bytes:
+    """Read a small regular file without following its final symlink.
+
+    O_NONBLOCK makes an attacker-planted FIFO or device fail closed instead of
+    hanging the panel helper.  Validation happens on the opened descriptor,
+    avoiding a check/use race, and the read loop enforces the limit even when a
+    file grows after fstat().
+    """
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise OSError(error.errno, f"Could not open {path} safely: {error.strerror}", path) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"Refusing to read non-regular file {path}")
+        if metadata.st_size > max_bytes:
+            raise OSError(f"Refusing to read {path}: exceeds {max_bytes} bytes")
+
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > max_bytes:
+            raise OSError(f"Refusing to read {path}: exceeds {max_bytes} bytes")
+        return content
+    finally:
+        os.close(descriptor)
 
 
 def backup(path: Path) -> Path | None:
     if not path.exists():
         return None
+    content = read_bytes(path)
     backup_dir = paths()["backups"]
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     target = backup_dir / f"{path.name}.{stamp}.bak"
-    shutil.copy2(path, target)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=backup_dir)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
     return target
 
 
@@ -199,18 +266,19 @@ def restore_file(path: Path, content: str | None) -> None:
 
 def read_text(path: Path) -> str | None:
     try:
-        return path.read_text(encoding="utf-8")
+        return read_bytes(path).decode("utf-8")
     except (FileNotFoundError, NotADirectoryError):
         return None
 
 
 def load_store() -> dict[str, Any]:
     path = paths()["data"]
-    if not path.exists():
-        return json.loads(json.dumps(DEFAULT_CONFIG))
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        content = read_text(path)
+        if content is None:
+            return json.loads(json.dumps(DEFAULT_CONFIG))
+        value = json.loads(content)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not read {path}: {error}") from error
     if not isinstance(value, dict):
         raise RuntimeError(f"Invalid hot corners data in {path}")
@@ -306,8 +374,11 @@ def load_shell_config() -> dict[str, Any]:
     path = paths()["shell"]
     source = path if path.exists() else paths()["shell_defaults"]
     try:
-        value = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        content = read_text(source)
+        if content is None:
+            raise FileNotFoundError(source)
+        value = json.loads(content)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not read shell configuration: {error}") from error
     if not isinstance(value, dict):
         value = {}
@@ -480,13 +551,13 @@ def fingerprint() -> str:
     # The backend copies itself into ~/.local/share, so a change to this file
     # has to count as a change to the runtime.
     digest.update(b"backend\0")
-    digest.update(Path(__file__).resolve().read_bytes())
+    digest.update(read_bytes(Path(__file__).resolve()))
     template = paths()["driver_template"]
     digest.update(b"driver\0")
-    digest.update(template.read_bytes() if template.is_file() else b"")
+    digest.update(read_bytes(template) if template.is_file() else b"")
     for path in vendor_files():
         digest.update(f"vendor/{path.name}\0".encode())
-        digest.update(path.read_bytes())
+        digest.update(read_bytes(path))
     return digest.hexdigest()
 
 
@@ -565,14 +636,14 @@ def legacy_mousetrap_is_ours() -> bool:
     legacy = paths()["legacy_mousetrap"]
     if not legacy.is_dir():
         return False
-    shipped = {path.name: path.read_bytes() for path in vendor_files()}
+    shipped = {path.name: read_bytes(path) for path in vendor_files()}
     if not shipped:
         return False
     for path in legacy.rglob("*"):
         if path.is_dir():
             return False
         expected = shipped.get(path.name)
-        if expected is None or path.read_bytes() != expected:
+        if expected is None or read_bytes(path) != expected:
             return False
     return True
 
